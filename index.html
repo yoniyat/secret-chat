@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Secret Chat</title>
+<style>
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;background:#0b1226;color:#e8ecff;font-family:system-ui,sans-serif}
+#app{height:100%;display:flex;flex-direction:column}
+.hidden{display:none!important}
+#login{margin:auto;width:min(340px,90%);display:flex;flex-direction:column;gap:12px}
+h1{font-size:26px;background:linear-gradient(90deg,#22d3ee,#8b5cf6);-webkit-background-clip:text;color:transparent}
+input[type=text],input[type=password]{padding:14px;border-radius:12px;border:1px solid #243058;background:#131c3a;color:#fff;font-size:16px;outline:none}
+button{padding:14px;border:0;border-radius:12px;background:linear-gradient(90deg,#22d3ee,#8b5cf6);color:#06101f;font-weight:700;font-size:16px}
+#chat{height:100%;display:flex;flex-direction:column}
+header{padding:12px 16px;display:flex;justify-content:space-between;align-items:center;background:#101a36;border-bottom:1px solid #243058}
+header span{font-size:12px;color:#7d8bb8}
+#msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:6px}
+.m{max-width:78%;padding:9px 13px;border-radius:16px;word-wrap:break-word;white-space:pre-wrap;font-size:15px}
+.m small{display:block;font-size:10px;opacity:.6;margin-top:3px}
+.m img{max-width:100%;max-height:300px;border-radius:10px;display:block}
+.me{align-self:flex-end;background:#2563eb;border-bottom-right-radius:4px}
+.them{align-self:flex-start;background:#1c2748;border-bottom-left-radius:4px}
+#bar{display:flex;gap:8px;padding:10px;background:#101a36;align-items:center}
+#bar input[type=text]{flex:1;min-width:0}
+#bar button{padding:0 18px;height:46px}
+#picbtn{background:#1c2748;color:#fff;padding:0 14px}
+#out{font-size:12px;background:none;color:#7d8bb8;padding:4px 8px;font-weight:400}
+#viewer{position:fixed;inset:0;background:#000e;display:flex;align-items:center;justify-content:center;z-index:9}
+#viewer img{max-width:100%;max-height:100%}
+</style></head><body>
+<div id="app">
+ <div id="login">
+  <h1>Secret Chat</h1>
+  <input type="text" id="name" placeholder="Your name" autocomplete="off">
+  <input type="password" id="code" placeholder="Shared secret code" autocomplete="off">
+  <button id="go">Enter</button>
+  <p style="font-size:12px;color:#7d8bb8">Use the same long secret code on both phones. Messages and photos are encrypted with it.</p>
+ </div>
+ <div id="chat" class="hidden">
+  <header><b id="title">Chat</b><span id="status">connecting…</span><button id="out">Leave</button></header>
+  <div id="msgs"></div>
+  <div id="bar">
+   <button id="picbtn" onclick="document.getElementById('pic').click()">📷</button>
+   <input type="file" id="pic" accept="image/*" class="hidden">
+   <input type="text" id="text" placeholder="Message" autocomplete="off">
+   <button id="send">Send</button>
+  </div>
+ </div>
+</div>
+<div id="viewer" class="hidden"><img id="vimg"></div>
+<script>
+const $=id=>document.getElementById(id);
+const enc=new TextEncoder(),dec=new TextDecoder();
+const b64=u=>{let s='';for(let i=0;i<u.length;i+=8192)s+=String.fromCharCode(...u.subarray(i,i+8192));return btoa(s)};
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+let key,topic,myId,name,es,seen=new Set(),hist=[];
+const urls=new Map();
+const S=(k,v)=>{try{v===undefined?localStorage.removeItem(k):localStorage.setItem(k,v)}catch(e){}};
+const G=k=>{try{return localStorage.getItem(k)}catch(e){return null}};
+const NTFY='https://ntfy.sh/';
+
+/* image storage */
+const idb=()=>new Promise((res,rej)=>{const r=indexedDB.open('sc',1);r.onupgradeneeded=()=>r.result.createObjectStore('img');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});
+const idbPut=async(k,v)=>{const d=await idb();return new Promise((res,rej)=>{const t=d.transaction('img','readwrite');t.objectStore('img').put(v,k);t.oncomplete=res;t.onerror=()=>rej(t.error)})};
+const idbGet=async k=>{const d=await idb();return new Promise((res,rej)=>{const q=d.transaction('img').objectStore('img').get(k);q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)})};
+async function getUrl(id){if(urls.has(id))return urls.get(id);const b=await idbGet(id);if(!b)return null;const u=URL.createObjectURL(b);urls.set(id,u);return u}
+
+/* crypto */
+async function derive(code){
+  const h=await crypto.subtle.digest('SHA-256',enc.encode('topic:'+code));
+  topic='sc-'+[...new Uint8Array(h)].slice(0,16).map(x=>x.toString(16).padStart(2,'0')).join('');
+  const base=await crypto.subtle.importKey('raw',enc.encode(code),'PBKDF2',false,['deriveKey']);
+  key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:enc.encode('secret-chat-v1'),iterations:100000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function encBytes(u8){
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,u8));
+  const all=new Uint8Array(12+ct.length);all.set(iv);all.set(ct,12);return all;
+}
+async function decBytes(a){return new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:a.slice(0,12)},key,a.slice(12)))}
+const seal=async obj=>b64(await encBytes(enc.encode(JSON.stringify(obj))));
+async function open(s){try{return JSON.parse(dec.decode(await decBytes(unb64(s))))}catch(e){return null}}
+
+/* UI */
+function view(u){$('vimg').src=u;$('viewer').classList.remove('hidden')}
+$('viewer').onclick=()=>$('viewer').classList.add('hidden');
+function render(m){
+  const d=document.createElement('div');
+  d.className='m '+(m.u===myId?'me':'them');
+  if(m.k==='img'){
+    const box=document.createElement('div');d.appendChild(box);
+    if(m.gone){box.textContent='📷 Photo expired'}
+    else{
+      const im=document.createElement('img');box.appendChild(im);
+      getUrl(m.id).then(u=>{
+        if(!u){box.textContent='📷 Photo unavailable';return}
+        im.onload=()=>{$('msgs').scrollTop=$('msgs').scrollHeight};
+        im.src=u;im.onclick=()=>view(u);
+      }).catch(()=>{box.textContent='📷 Photo unavailable'});
+    }
+  }else{
+    const t=document.createElement('span');t.textContent=m.t;d.appendChild(t);
+  }
+  const s=document.createElement('small');
+  s.textContent=(m.u===myId?'':m.n+' · ')+new Date(m.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  d.appendChild(s);
+  const box=$('msgs'),atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<80;
+  box.appendChild(d);if(atBottom||m.u===myId)box.scrollTop=box.scrollHeight;
+}
+function addMsg(m){
+  if(seen.has(m.id))return;seen.add(m.id);
+  hist.push(m);hist.sort((a,b)=>a.ts-b.ts);
+  S('hist:'+topic,JSON.stringify(hist.slice(-300)));
+  if(hist[hist.length-1]===m)render(m);
+  else{$('msgs').innerHTML='';hist.forEach(render)}
+}
+
+/* network */
+function connect(){
+  if(es)es.close();
+  es=new EventSource(NTFY+topic+'/sse?since=12h');
+  es.onopen=()=>$('status').textContent='connected';
+  es.onerror=()=>$('status').textContent='reconnecting…';
+  es.onmessage=async e=>{
+    let j;try{j=JSON.parse(e.data)}catch(x){return}
+    if(j.event!=='message')return;
+    const m=await open(j.message);
+    if(!m||!m.id||seen.has(m.id))return;
+    if(m.k==='img'){
+      if(m.u!==myId&&!(await idbGet(m.id).catch(()=>null))){
+        if(!j.attachment){m.gone=true}
+        else{
+          try{
+            const r=await fetch(j.attachment.url);
+            if(r.status===404||r.status===410){m.gone=true}
+            else if(!r.ok)return;
+            else{
+              const raw=await decBytes(new Uint8Array(await r.arrayBuffer()));
+              await idbPut(m.id,new Blob([raw],{type:'image/jpeg'}));
+            }
+          }catch(x){return}
+        }
+      }
+      addMsg(m);
+    }else if(m.t){addMsg(m)}
+  };
+}
+async function send(){
+  const t=$('text').value.trim();if(!t)return;
+  $('text').value='';
+  const m={id:crypto.randomUUID(),u:myId,n:name,t,ts:Date.now()};
+  addMsg(m);
+  try{
+    const r=await fetch(NTFY+topic,{method:'POST',body:await seal(m)});
+    if(!r.ok)throw 0;
+  }catch(e){$('status').textContent='send failed'}
+}
+$('pic').onchange=async e=>{
+  const f=e.target.files[0];e.target.value='';if(!f)return;
+  try{
+    $('status').textContent='sending photo…';
+    const bmp=await createImageBitmap(f);
+    const sc=Math.min(1,1280/Math.max(bmp.width,bmp.height));
+    const cv=document.createElement('canvas');
+    cv.width=Math.round(bmp.width*sc);cv.height=Math.round(bmp.height*sc);
+    cv.getContext('2d').drawImage(bmp,0,0,cv.width,cv.height);
+    const blob=await new Promise(r=>cv.toBlob(r,'image/jpeg',0.75));
+    const m={id:crypto.randomUUID(),u:myId,n:name,k:'img',t:'',ts:Date.now()};
+    await idbPut(m.id,blob);
+    addMsg(m);
+    const body=await encBytes(new Uint8Array(await blob.arrayBuffer()));
+    const r=await fetch(NTFY+topic,{method:'PUT',headers:{'X-Message':await seal(m),'X-Filename':'p.bin'},body});
+    if(!r.ok)throw 0;
+    $('status').textContent='connected';
+  }catch(x){$('status').textContent='photo failed'}
+};
+
+/* start / leave */
+async function start(n,c){
+  name=n;myId=G('uid')||crypto.randomUUID();S('uid',myId);
+  await derive(c);
+  $('login').classList.add('hidden');$('chat').classList.remove('hidden');
+  $('title').textContent=name;
+  try{JSON.parse(G('hist:'+topic)||'[]').forEach(m=>{seen.add(m.id);hist.push(m)})}catch(e){}
+  hist.forEach(render);$('msgs').scrollTop=$('msgs').scrollHeight;
+  connect();
+  if(window.Android){
+    Android.start(c,myId);
+    if(!G('bat')){S('bat','1');setTimeout(()=>Android.battery(),1500)}
+  }
+}
+$('go').onclick=()=>{
+  const n=$('name').value.trim(),c=$('code').value;
+  if(!n||c.length<6){alert('Enter a name and a secret code (6+ characters).');return}
+  S('name',n);S('code',c);start(n,c);
+};
+$('send').onclick=send;
+$('text').onkeydown=e=>{if(e.key==='Enter')send()};
+$('out').onclick=()=>{S('code');if(window.Android)Android.stop();if(es)es.close();location.reload()};
+$('name').value=G('name')||'';
+if(G('name')&&G('code'))start(G('name'),G('code'));
+</script></body></html>

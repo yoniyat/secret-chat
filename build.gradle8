@@ -1,0 +1,21 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.secretchat.app'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'com.secretchat.app'
+        minSdk 26
+        targetSdk 34
+        versionCode 2
+        versionName "1.1"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.8.0'
+}
